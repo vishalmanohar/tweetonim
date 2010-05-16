@@ -362,8 +362,8 @@ FOOTER = "</body></html>"
 CONTENT = """<p>Add tweetonim@appspot.com as your GTalk buddy and type 'help' </p>"""
 
 HELP = """\n
-Type 'fetch to get latest tweets \n
-Type 'fetch <screenname> to get latest tweets by screenname'  \n
+Type 'fetch to get latest tweets
+Type 'fetch <screenname> to get latest tweets by screenname'
 Type a message to post to Twitter
 """
 
