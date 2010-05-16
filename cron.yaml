@@ -1,0 +1,4 @@
+cron:
+- description: send recent updates job
+  url: /sendrecent
+  schedule: every 15 minutes
