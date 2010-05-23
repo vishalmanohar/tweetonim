@@ -3,6 +3,8 @@ OAuth code is based on example at http://github.com/tav/tweetapp
 """
 
 import sys
+import logging
+import re
 
 from datetime import datetime, timedelta
 from hashlib import sha1
@@ -34,15 +36,18 @@ OAUTH_APP_SETTINGS = {
 
     'twitter': {
 
-        'consumer_key': 'SET-YOUR-OWN-APP-VALUE',
-        'consumer_secret': 'SET-YOUR-OWN-APP-VALUE',
+        'consumer_key': 'PROVIDE-YOUR-CONSUMER-KEY',
+        'consumer_secret': 'PROVIDE-YOUR-CONSUMER-SECRET',
 
         'request_token_url': 'https://twitter.com/oauth/request_token',
         'access_token_url': 'https://twitter.com/oauth/access_token',
         'user_auth_url': 'http://twitter.com/oauth/authorize',
+        
 
         'default_api_prefix': 'http://twitter.com',
         'default_api_suffix': '.json',
+
+        'bitly_url_prefix' : 'http://api.bit.ly/v3/shorten?format=txt&login=PROVIDE_USERNAME&apiKey=PROVIDE_API_KEY&longUrl=',
 
         },
 
@@ -131,11 +136,7 @@ class OAuthClient(object):
 
         if self.token is None:
             '''self.token = OAuthAccessToken.get_by_key_name(self.get_cookie())'''
-            tokens = OAuthAccessToken.all().filter(
-                'email =', self.email)
-            
-            for token in tokens:
-                self.token = token
+            self.token = getAccessToken(self.email)
 
         fetch = urlfetch(self.get_signed_url(
             api_method, self.token, http_method, **extra_params
@@ -184,7 +185,6 @@ class OAuthClient(object):
 
         if proxy_id:
             return "FOO%rFF" % proxy_id
-            self.expire_cookie()
 
         return self.get_request_token()
 
@@ -359,13 +359,36 @@ HEADER = """
 
 FOOTER = "</body></html>"
 
-CONTENT = """<p>Add tweetonim@appspot.com as your GTalk buddy and type 'help' </p>"""
+CONTENT = """<p>Add tweetonim@appspot.com as your GTalk buddy and type 'help' </p>
+<p>For feedback, tweet @vishalmanohar </p>
+"""
 
-HELP = """\n
-Type 'fetch to get latest tweets
-Type 'fetch <screenname> to get latest tweets by screenname'
+HELP = """
+Type 'fetch' to get latest tweets from homepage
+Type 'fetch <screenname>' to get latest tweets by screenname'
+Type 'more' to go deeeper on any previous fetch of tweets
+Type 'lists' to list all your lists
+Type 'list N' to show tweets from the Nth list
+Type 'RT N' to retweet the Nth tweet of the most recent fetch
+Type 'reply N' to reply to a tweet
 Type a message to post to Twitter
 """
+
+class BaseRequestHandler(RequestHandler):
+    def fetchTweets(self, client, email, api_method, **extra_params):
+        response = client.get(api_method, **extra_params)
+        
+        user_cache = UserCache(email, api_method, **extra_params)
+        messages = []
+        if len(response) > 0:
+            user_cache.max_id  = response[len(response) - 1]["id"]
+            user_cache.since_id = response[0]["id"]
+            
+        user_cache.messages = response
+        
+        memcache.set("user_cache_" + email, user_cache)
+        
+        return response
 
 class MainHandler(RequestHandler):
     """Demo Twitter App."""
@@ -390,7 +413,7 @@ class MainHandler(RequestHandler):
             self.redirect(users.create_login_url("/"))
             
 
-class XMPPHandler(RequestHandler):
+class XMPPHandler(BaseRequestHandler):
     def post(self):
         message = xmpp.Message(self.request.POST)
         sender = getUserEmailId(message.sender)
@@ -400,19 +423,105 @@ class XMPPHandler(RequestHandler):
         if message.body[0:4].lower() == 'help':
             message.reply(HELP)
         elif message.body.strip().lower() == 'fetch':
-            response = client.get('/statuses/home_timeline', count = 5)
+            response = self.fetchTweets(client, sender, 
+                                   '/statuses/home_timeline', count = 5)
             message.reply(getFormattedMessage(response))
         elif message.body[0:5].strip().lower() == 'fetch':
             screenname = message.body.replace('fetch', '', 1).strip()
-            response = client.get('/statuses/user_timeline', 
-                                  screen_name = screenname, count = 5)
+            response = self.fetchTweets(client, sender, 
+                                   '/statuses/user_timeline', 
+                                   screen_name = screenname, count = 5)
             message.reply(getFormattedMessage(response))
-        else:
-            if len(message.body) > 140:
-                message.reply('Exceeds 140 char limit by ' + 
-                              str(len(message.body) - 140) + ' chars.')
+        elif message.body.strip().lower() == 'more':
+            user_cache = memcache.get("user_cache_" + sender)
+            if user_cache is not None:
+                params = user_cache.extraparams
+                params['max_id'] = user_cache.max_id
+                
+                if 'since_id' in params:
+                    params.pop('since_id')
+    
+                response = self.fetchTweets(client, sender, user_cache.api_method, 
+                                            **params)
+                message.reply(getFormattedMessage(response))
             else:
-                client.post('/statuses/update', status = message.body)
+                message.reply("Don't remember previous query. Please fetch afresh.")
+        elif message.body.strip().lower() == 'lists':
+            token = getAccessToken(sender)
+            response = client.get('/' + token.specifier + '/lists')
+            message.reply(getFormattedListMessage(response))
+            
+        elif message.body[0:4].strip().lower() == 'list':
+            list_index = int(message.body.replace('list', '', 1).strip().strip('@'))
+            token = getAccessToken(sender)
+            client.token = token
+            
+            lists = client.get('/' + token.specifier + '/lists')['lists']
+            
+            if len(lists) == 0 or len(lists) < list_index:
+                message.reply('Incorrect list index given.')
+            else:
+                list_id = str(lists[list_index - 1]["id"])
+                logging.info('/' + token.specifier + '/lists/' 
+                                   + list_id)
+                response = self.fetchTweets(client, sender, 
+                                   '/' + token.specifier + '/lists/' 
+                                   + list_id + '/statuses', per_page = 5)
+                message.reply(getFormattedMessage(response))
+        elif message.body[0:2].strip().lower() == 'rt' and len(message.body) <= 6:
+            message_index = int(message.body.strip('RT').strip('rt').
+                                replace('@', '').strip())
+            user_cache = memcache.get("user_cache_" + sender)
+            if len(user_cache.messages) < message_index:
+                message.reply("@"+ message_index 
+                              + " message index doesn't exist in my cache.")
+            else:
+                message_id = user_cache.messages[message_index - 1]["id"]
+                client.post('/statuses/retweet/' + str(message_id))
+                tweet = user_cache.messages[message_index - 1]
+                message.reply('Retweeted: RT @' +  tweet["user"]["screen_name"] 
+                              + ' ' + tweet["text"])
+        elif message.body[0:6].lower() == 'reply ':
+            message_index = int(message.body.split(' ')[1].
+                                replace('@', '').strip())
+            user_cache = memcache.get("user_cache_" + sender)
+            
+            if len(user_cache.messages) < message_index:
+                message.reply("@"+ message_index 
+                              + " message index doesn't exist in my cache.")
+            else:
+                message_id = user_cache.messages[message_index - 1]["id"]
+                reply_to_author = user_cache.messages[message_index - 1]["user"]["screen_name"] 
+                parts = message.body.split(' ')
+                
+                msg = '@' + reply_to_author + ' ' + message.body.replace(parts[0], '').replace(parts[1], '').strip()
+                
+                if len(msg) > 140:
+                    message.reply('Reply to message exceeds 140 char limit by ' + 
+                              str(len(msg) - 140) + ' chars.')
+                else:
+                    client.post('/statuses/update', status = msg, in_reply_to_status_id = message_id)
+                    message.reply('Posted to Twitter: ' + msg)
+                
+        else:
+            tweet = message.body
+            #try to shorten any link
+            r = re.compile(r"(http://[^ ]+)")
+            match = r.search(tweet)
+
+            if match is not None:
+                link = match.group()
+                #link = urllib.quote_plus(link)
+                result = urlfetch(OAUTH_APP_SETTINGS['twitter']['bitly_url_prefix'] + link)
+                if result.status_code == 200:
+                    short_link = result.content
+                    tweet = tweet.replace(link, short_link)
+                
+            if len(tweet) > 140:
+                message.reply('Exceeds 140 char limit by ' + 
+                              str(len(tweet) - 140) + ' chars.')
+            else:
+                client.post('/statuses/update', status = tweet)
                 message.reply('Posted to Twitter')
 
 class SendRecentHandler(RequestHandler):
@@ -420,7 +529,7 @@ class SendRecentHandler(RequestHandler):
         taskqueue.add(url='/sendrecentworker', params={'cursor': 0})
 
 
-class SendRecentWorker(RequestHandler):
+class SendRecentWorker(BaseRequestHandler):
     def post(self):
         cursor = int(self.request.get("cursor", default_value=0))
         tokens = OAuthAccessToken.all().fetch(10, offset = cursor)
@@ -429,35 +538,69 @@ class SendRecentWorker(RequestHandler):
             if xmpp.get_presence(token.email):
                 client = OAuthClient('twitter', self, token.email)
                 
-                last_sent_id = memcache.get("last_sent_" + token.email)
+                user_cache = memcache.get("user_cache_" + token.email)
                 
-                if last_sent_id is not None:
-                    response = client.get('/statuses/home_timeline', count = 5, 
-                                      since_id = last_sent_id)
+                if user_cache is not None and user_cache.since_id is not None:
+                    #response = client.get('/statuses/home_timeline', count = 5, 
+                    #                  since_id = last_sent_id)
+                    logging.info('since_id:' +  str(user_cache.since_id))
+                    response = self.fetchTweets(client, token.email, 
+                                    '/statuses/home_timeline', count = 5, 
+                                      since_id = user_cache.since_id)
                 else:
-                    response = client.get('/statuses/home_timeline', count = 5)
-                    
+                    response = self.fetchTweets(client, token.email, 
+                                    '/statuses/home_timeline', count = 5)
+                
                 if len(response) > 0:
-                    xmpp.send_message(token.email, getFormattedMessage(response))
-                    last_sent_id = response[0]["id"]
-                    memcache.set("last_sent_" + token.email, last_sent_id)
+                    xmpp.send_message(token.email, 'Some recent tweets:' + getFormattedMessage(response))
         
         if len(tokens) == 10:
             taskqueue.add(url='/sendrecentworker', 
                           params={'cursor': cursor + 10})
 
-
+            
+class UserCache:
+    def __init__(self, email, api_method, **extraparams):
+        self.email = email
+        self.api_method = api_method
+        self.extraparams = extraparams
+        self.since_id = None
+        self.max_id = None
+        self.messages = None
+        
 def getUserEmailId(string):
     return string.partition('/')[0]
 
 def getFormattedMessage(messages):
     msg = ''
+    count = 1
     for message in messages:
-        msg = msg + '\n' + '*' + message["user"]["screen_name"] + '*: ' + message["text"]
+        msg = msg + '\n' + str(count) + ' *' + message["user"]["screen_name"] + '*: ' + message["text"]
+        count = count + 1
     
     return msg
+
+def getFormattedListMessage(response):
     
-            
+    lists = response['lists']
+    
+    msg = 'You are following these lists:'
+    count = 1
+    
+    for lst in lists:
+        msg = msg + '\n ' + str(count) + ' ' + lst["name"]
+        count = count + 1
+        
+    if count == 1:
+        return 'You are not following any lists yet.' 
+    
+    return msg
+
+def getAccessToken(email):
+    tokens = OAuthAccessToken.all().filter('email =', email)
+    for token in tokens:
+        return token
+    
 # ------------------------------------------------------------------------------
 # self runner -- gae cached main() function
 # ------------------------------------------------------------------------------
